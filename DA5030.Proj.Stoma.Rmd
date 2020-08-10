@@ -1,0 +1,1273 @@
+---
+title: "Stoma_Project"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+
+
+```{r echo = FALSE, message = FALSE}
+library(kableExtra)
+library(kernlab)
+library(xtable)
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(stringi)
+library(stringr)
+library(e1071)
+library(caret)
+library(rpart)
+library(ggplot2)
+library(stats)
+library(neuralnet)
+library(class)
+library(pROC)
+library(RANN)
+library(fastDummies)
+library(Hmisc)
+library(tree)
+library(C50)
+library(ROSE)
+library(rpart)
+library(knitr)
+library(corrplot)
+library(stargazer)
+library(MASS)
+library(car)
+library(neuralnet)
+library(mice)
+library(ROSE)
+library(caretEnsemble)
+library(stringi)
+library(knitr)
+opts_chunk$set(tidy.opts = list(width.cutoff = 60), tidy = TRUE)
+
+
+```
+
+# Full data set creation: 
+
+The first dataset contains survee results from blood surbey from 2007 - 2008 - specifically, examination of blood pressure. Blood pressure values ( systolic , diastolic, enhacement used), as well as cuff size, pulse rate, coffee, alcohol, food intake in the last 30 minutes were recorded. 
+The second dataset contains blood lab results - % of basophils, monocytes, Segmented neutrophils percent, Eosinophils percent, red blood cell count, and other standard adn derived lab values. This a valuable dataset for overall health evalutaion. 
+```{r data prep1 }
+# blood pressure data
+blood.2<- read.csv("25505-0011-Data.tsv", sep = "\t")
+blood.2<- blood.2[, 1:27]
+
+# blood lab work data 
+labs<- read.csv("25505-0102-Data.tsv", sep = "\t")
+labs<- labs[,1:21]
+```
+
+Third dataset contains reported health status for the patients in the previosu two datasets.  I want to examine whether it is sufficient information to make predictions of the health status of a person based on mostly blood related data. While blood labs and surveys have been a cornerstone and a first step in many medical encounters, it is interesting to see how that related to the overall reported health status and weather general blood lab can be used to manage health status **preemptively**.
+
+```{r data prep2}
+health<- read.csv("25505-0207-Data.tsv", sep = "\t")
+# we only want the response variable and SEQN to add it to the combined dataset:
+health<- health %>% dplyr::select(SEQN, HSD010)
+```
+
+
+Modify the features that need to be encoded as factors. 
+```{r blood to factor - data prep3}
+blood.2$PEASCST1<- as.factor(blood.2$PEASCST1)
+blood.2$PEASCCT1<- as.factor(blood.2$PEASCCT1)
+blood.2$BPQ150A<- as.factor(blood.2$BPQ150A)
+blood.2$BPQ150B<- as.factor(blood.2$BPQ150B)
+blood.2$BPQ150C<- as.factor(blood.2$BPQ150C)
+blood.2$BPQ150D<- as.factor(blood.2$BPQ150D)
+blood.2$BPAARM<- as.factor(blood.2$BPAARM)
+blood.2$BPACSZ<- as.factor(blood.2$BPACSZ)
+blood.2$BPXPULS<- as.factor(blood.2$BPXPULS)
+blood.2$BPXPTY<- as.factor(blood.2$BPXPTY)
+blood.2$BPAEN1<- as.factor(blood.2$BPAEN1)
+blood.2$BPAEN2<- as.factor(blood.2$BPAEN2)
+blood.2$BPAEN3<- as.factor(blood.2$BPAEN3)
+blood.2$BPAEN4<- as.factor(blood.2$BPAEN4)
+
+```
+
+
+Combine the datasets based on the individual SEQN  - patient ID. 
+
+```{r df creation }
+full.df<- inner_join(blood.2, labs, by = "SEQN")
+full.df<- inner_join(health, full.df, by = "SEQN")
+```
+
+```{r}
+summary(full.df)
+```
+
+
+## Missing value exploration:
+
+This graph does a quick summary of vizualization of missingness of the data per column (% of all rows). These graphs are aids in feature selection and decision making regarding eliminating entire features. 
+
+```{r VIM full }
+library(naniar)
+gg_miss_var(full.df, show_pct = TRUE) + theme(axis.text.y = element_text(size = 6))
+```
+
+Further visualization of missingness:
+```{r VIM viz2 full }
+library(VIM)
+res<-summary(aggr(full.df, sortVar=TRUE))$combinations
+```
+
+
+
+## Feature selection: 
+
+Some values have the majority of the rows missing, so those features will be omitted form the dataset overall:  PEASCCT1         BPXCHR , BPXSY4          BPXDI4           BPAEN4   ;
+
+There are consistently higher number of missing values, especially as we are progression from the first measure of blood pressure towards 4th. For the purpsoe of dealing with missing values in the ~10,000 members, I am dropping the last 4 columns, which correspond to the measurement of the 
+fourth reading of systtolc and dystolic blood pressure in the blood pressure data set. Since there are 9762 observations, having columns with 9537 missing values of BP reading is useless, nor informative, and bias prone if the values were to be imputed. Along the same line of thinking, I am going to eliminate the feautre PEASCCT1 - blood pressure comment. While it is a categorical feature, its input is not demanded and is missing the good chunk of the data 9357 out of 9762. Similar for BPXCHR. 
+
+```{r}
+full.df<- full.df %>% 
+  dplyr::select(-c(PEASCCT1, BPXSY4, BPXSY4, BPXDI4, BPAEN4, BPXCHR))
+summary(full.df)
+```
+
+We are going to omit all rows which have the response variable missing (HSD010) - this cuts down on my patient cohort in the study but the number is still sufficient to be inoformative in the classification task of the health status of the patient.
+
+__Ommitting the missing patient answer response:__
+
+Exploration of rows where the response variable is NA and subsequent exclusion from the final cohort:
+
+```{r}
+completeFun <- function(data, desiredCols){
+  completeVec<- complete.cases(data[, desiredCols])
+  return(data[completeVec, ])
+}
+
+full.df<- completeFun(full.df, "HSD010")
+summary(full.df)
+```
+
+
+__Additional step of feature selection__:
+
+```{r}
+# indexing the rows where all columns have missing values but omitting the sequence id for the patient, as well as the repsonse variable, and blood pressure variable - none are missing there by our previous clean up and definition.
+ind <- apply(full.df[,-c(1,2,3)], 1, function(x) all(is.na(x)))
+
+cat(sum(ind), "is the number of rows where all values are missing and therefore should be discarded\n")
+
+full.df <-full.df[ !ind, ]
+
+cat("New dataset dimensions are the following:", dim(full.df)[1], "rows,", dim(full.df)[2], "features")
+```
+
+
+### Recoding of the Response HSD010 variable:
+
+
+The response variable of the health quality measured on the following scale: 
+
+![Description of the response variable scale](response_var.png)
+
+
+Based on this description, I am using the first three entries to encode 1 as in "good health" and the rest as "not good/ difficulty answering", which would indicate additional research needed into that area/ answer.
+
+```{r}
+# original breakdown of the categories:
+table(full.df$HSD010)
+full.df$HSD010_re<- ifelse(full.df$HSD010 == 1|full.df$HSD010 == 2|full.df$HSD010 == 3, 1, 0)
+
+cat("new breakdown of the response",table(full.df$HSD010_re))
+full.df$HSD010_re<- as.factor(full.df$HSD010_re)
+```
+
+
+### Distribution exploration:
+
+This is a distribution plot of all the numeric features - it is hard to analyse anything with such density of plotting, so I will break it down to parts.
+
+```{r distr fulldf all}
+full.df  %>%  dplyr::select(-SEQN, -HSD010) %>% 
+  dplyr::select_if(is.numeric) %>%  gather(cols, value) %>% 
+  ggplot(aes(x = value)) +
+  geom_histogram() + 
+  facet_wrap(.~cols, scale = "free") +
+  ggtitle("Distributions of the numeric\n values in the full blood dataset- \n  labs and pressure") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))  + 
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+
+
+__Plane 1:__
+
+Plotting the disrtibution of the kept features: 
+BPXDI1,2,3 visble have outliers on the left tail - just about zero. Since this values represent Diastolic pressure and inlikely to realistically be 0, these should be imputed/ omitted as these are not real values in terms of meaningfulness. Additionally, the distribution of some of the features are skewed(BPXSY1) and will undergo transformation. 
+
+```{r}
+full.df  %>%  dplyr::select(BPXDI1, BPXDI2,BPXDI3, BPXPLS, BPXSY1, BPXSY2, BPXSY3) %>% 
+  dplyr::select_if(is.numeric) %>%  
+  gather(cols, value) %>%  
+  ggplot(aes(x = value)) + 
+  geom_histogram() + facet_wrap(.~cols, scale = "free") + 
+  ggtitle("Distributions of the numeric\n values in the full blood dataset- \n  labs and pressure") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))  + 
+  theme(plot.title = element_text(hjust = 0.5))
+```
+Evident outliers and skewness in the top three graphs - transphormation and imputation to be performed. 
+
+
+__Plane 2:__
+
+```{r}
+full.df  %>%  
+  dplyr::select(PEASCTM1, BPXML1, LBXWBCSI, LBXLYPCT, 
+                LBXMOPCT, LBXNEPCT, LBXEOPCT,LBXBAPCT, LBDLYMNO ) %>% 
+  dplyr::select_if(is.numeric) %>%  
+  gather(cols, value) %>% 
+  ggplot(aes(x = value)) + 
+  geom_histogram() + 
+  facet_wrap(.~cols, scale = "free") + 
+  ggtitle("Distributions of the numeric\n values in the full blood dataset- \n  labs and pressure - PART2") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))  +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+Additionally, PEASCTM1 - Blood Pressure Time in Seconds also has outliers on the left - we do no expect this time to be 0 realistically, therefore, imputation of the outliers with median values will take place. Additional skewness of data in LBXEOPCT and PEASCTM1. 
+
+In this case, skewness and "non scaleness" and "non centerness" will be issues in my imputation procedure if I choose to proceed with kNN. 
+
+
+__Plane 3:__
+
+```{r}
+full.df  %>%  
+  dplyr::select(LBDMONO, LBDNENO, LBDEONO, LBDBANO, 
+                LBXRBCSI, LBXHGB, LBXHCT,LBXMCVSI,
+                LBXMCHSI, LBXMC, LBXRDW, LBXPLTSI, LBXMPSI ) %>%
+  dplyr::select_if(is.numeric) %>% 
+  gather(cols, value) %>%  
+  ggplot(aes(x = value)) + 
+  geom_histogram() + 
+  facet_wrap(.~cols, scale = "free") + 
+  ggtitle("Distributions of the numeric\n values in the full blood dataset- \n  labs and pressure - PART3") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))  + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  theme(axis.text.x = element_text(size = 4))
+
+```
+
+
+
+### Center and Scale numerical 
+
+```{r}
+# scale and center numerical variables:
+full.df<- full.df %>%
+   mutate_at(c("PEASCTM1", "BPXPLS", "BPXML1",
+               "BPXSY1", "BPXDI1", "BPXDI2",
+               "BPXDI3", "BPXSY2", "BPXSY3", 
+               "LBXWBCSI", "LBXLYPCT", "LBXMOPCT",
+               "LBXNEPCT", "LBXEOPCT", "LBXBAPCT",
+               "LBDLYMNO", "LBDMONO", "LBDNENO", "LBDEONO", 
+               "LBDBANO", "LBXRBCSI", "LBXHGB", "LBXHCT",
+               "LBXMCVSI", "LBXMCHSI", "LBXMC", "LBXRDW",
+               "LBXPLTSI", "LBXMPSI"), 
+             funs(c(scale(., center = TRUE, scale = TRUE))))
+
+
+summary(full.df)
+```
+
+Upon scaling and centering the dataset ( as evident from the summary where the mean for all of my numerical features is 0), we can proceed to  remove the outliers from some of the numerical features and impute numerical missing values. 
+
+
+## Outlier exploration:
+
+This dataset contains scaled and centered numerica values. Next, I am going to explore what to do with the outliers in the dataset. As a result of scaling and centering, some of the skeness issues became less significant. Other feature would still need to be transformed - 
+
+"BPXDI3", "BPXSY2", "BPXSY3", "LBXWBCSI", "LBXLYPCT", "LBXMOPCT", "LBXNEPCT", "LBXEOPCT", "LBXBAPCT", "LBDLYMNO", "LBDMONO", "LBDNENO", "LBDEONO", "LBDBANO", "LBXRBCSI", "LBXHGB", "LBXHCT", "LBXMCVSI", "LBXMCHSI", "LBXMC", "LBXRDW", "LBXPLTSI", "LBXMPSI"
+
+```{r}
+full.df %>%
+  dplyr::select(c("PEASCTM1", "BPXPLS", "BPXML1", 
+                  "BPXSY1", "BPXDI1", "BPXDI2")) %>% 
+  gather(cols, value) %>%  
+  ggplot(aes(x = value)) + 
+  geom_histogram() + 
+  facet_wrap(.~cols, scale = "free") + 
+  ggtitle("Distributions of the numeric\n values in the full blood dataset- \n  labs and pressure") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))  + 
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+Part 2: 
+```{r}
+full.df %>% 
+  dplyr::select(c("BPXDI3", "BPXSY2", "BPXSY3", 
+                  "LBXWBCSI", "LBXLYPCT", "LBXMOPCT",
+                  "LBXNEPCT", "LBXEOPCT", "LBXBAPCT", 
+                  "LBDLYMNO", "LBDMONO")) %>% 
+  gather(cols, value) %>%  
+  ggplot(aes(x = value)) + geom_histogram() + 
+  facet_wrap(.~cols, scale = "free") + 
+  ggtitle("Distributions of the numeric\n values in the full blood dataset- \n  labs and pressure") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))  + 
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+
+Part 3: 
+
+```{r}
+full.df %>% 
+  dplyr::select(c("LBDNENO", "LBDEONO", "LBDBANO",
+                  "LBXRBCSI", "LBXHGB", "LBXHCT", "LBXMCVSI", 
+                  "LBXMCHSI", "LBXMC", "LBXRDW", "LBXPLTSI", 
+                  "LBXMPSI")) %>% gather(cols, value) %>% 
+  ggplot(aes(x = value)) +
+  geom_histogram() + 
+  facet_wrap(.~cols, scale = "free") + 
+  ggtitle("Distributions of the numeric\n values in the full blood dataset- \n  labs and pressure") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))  + 
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+## Outlier removal: 
+
+As mentioned above, three numerical features contain outliers (in the non transformed values, Diastolic blood pressure of ~0). These should be substituted - I will use median imputation for these values - BPXDI1, BPXDI2, BPXDI3 with the cutoff of 3.5 z score. 
+
+```{r}
+full.df$BPXDI1[abs(full.df$BPXDI1) > 3.5]<- median(full.df$BPXDI1, na.rm = TRUE)
+full.df$BPXDI2[abs(full.df$BPXDI2) > 3.5]<- median(full.df$BPXDI2, na.rm = TRUE)
+full.df$BPXDI3[abs(full.df$BPXDI3) > 3.5]<- median(full.df$BPXDI3, na.rm = TRUE)
+full.df$PEASCTM1[abs(full.df$PEASCTM1) >3.5]<- median(full.df$PEASCTM1, na.rm = TRUE)
+```
+
+__Checking the distribution after scaling and removing the outliers__:
+
+```{r}
+full.df  %>%  
+  dplyr::select(BPXDI1, BPXDI2, BPXDI3, PEASCTM1) %>% 
+  dplyr::select_if(is.numeric) %>%  gather(cols, value) %>%  
+  ggplot(aes(x = value)) + 
+  geom_histogram() + facet_grid(.~cols, scale = "free") + 
+  ggtitle("Distributions of the scaled, mediam imputed blood exam values") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))  + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+This new dataset contains no outliers in the numerical features of the Diastolic Blood Pressure. However, the distribution of PEASCTM1 is still somewhat trimodal - I am going to proceed with this data. 
+
+
+At this point the dataset still contains many missing values in some of the feaures - I am going to proceed with imputation. 
+
+```{r}
+full.df %>%
+  summary() 
+```
+
+
+Since this dataset has mixed types of data- categorical and numeric - imputation technqiues can really vary. I will explore two versions - all numerical features will be imputed using kNN, and all categorical features will be imputed using median. Alternatively, I found a package called __mice__, which utilizes a number of decision rules to impute both categorical and numeric features. 
+
+## Imputation: 
+
+### kNN imputation of the numeric values:
+
+For imputation of numeric features with knn, there cannot be rows which have all features missing - I am going to check if there are any rows like that and exclude them from this version of the dataframe for the model:
+Although the kNN imputation does not require a normally distributed data, we need this assumption for the neural network and logistic regression, as well as scale and center the data for knn. 
+```{r}
+nm.integer<- full.df %>% 
+  dplyr::select(-c(SEQN, HSD010, HSD010_re)) %>% 
+  dplyr::select_if(is.numeric) %>% names()
+```
+
+
+```{r}
+# the list of numerical columns I will knn impute in the next step:
+paste(nm.integer, collapse = "','")
+```
+Numerical columns list: 
+
+'PEASCTM1','BPXPLS','BPXML1','BPXSY1','BPXDI1','BPXSY2','BPXDI2','BPXSY3','BPXDI3','LBXWBCSI','LBXLYPCT','LBXMOPCT','LBXNEPCT',
+'LBXEOPCT','LBXBAPCT','LBDLYMNO','LBDMONO','LBDNENO','LBDEONO','LBDBANO','LBXRBCSI','LBXHGB','LBXHCT','LBXMCVSI',
+'LBXMCHSI','LBXMC','LBXRDW','LBXPLTSI','LBXMPSI'
+
+```{r knn imputation}
+# these are the rows that contain missing values in all numerical features and therefore cannot be imputed with knn in caret package. I am going to delete these rows from the dataset:
+badrow<- apply(full.df[, c('PEASCTM1','BPXPLS','BPXML1',
+                           'BPXSY1','BPXDI1','BPXSY2','BPXDI2',
+                           'BPXSY3','BPXDI3','LBXWBCSI','LBXLYPCT',
+                           'LBXMOPCT','LBXNEPCT','LBXEOPCT','LBXBAPCT',
+                           'LBDLYMNO','LBDMONO','LBDNENO','LBDEONO',
+                           'LBDBANO','LBXRBCSI','LBXHGB','LBXHCT',
+                           'LBXMCVSI','LBXMCHSI','LBXMC','LBXRDW',
+                           'LBXPLTSI','LBXMPSI')], 1, function(x) all(is.na(x)))
+
+
+cat(sum(badrow), "is a reasonable number of rows to exclude from the dataset to achieve better imputation with knn.")
+
+# preprocessign with knn 
+full_imputed_knn<- preProcess(full.df[!badrow, c('PEASCTM1','BPXPLS','BPXML1','BPXSY1','BPXDI1',
+                                                 'BPXSY2','BPXDI2','BPXSY3','BPXDI3','LBXWBCSI',
+                                                 'LBXLYPCT','LBXMOPCT','LBXNEPCT','LBXEOPCT',
+                                                 'LBXBAPCT','LBDLYMNO','LBDMONO','LBDNENO','LBDEONO',
+                                                 'LBDBANO','LBXRBCSI','LBXHGB','LBXHCT',
+                                                 'LBXMCVSI','LBXMCHSI','LBXMC','LBXRDW',
+                                                 'LBXPLTSI','LBXMPSI')], 
+                              method = "knnImpute", k = 6)
+
+# fully imputed dataframe:
+full_imputed_df <- predict(full_imputed_knn,full.df[!badrow, 
+                                                    c('PEASCTM1','BPXPLS','BPXML1',
+                                                               'BPXSY1','BPXDI1','BPXSY2',
+                                                               'BPXDI2','BPXSY3','BPXDI3','LBXWBCSI',
+                                                               'LBXLYPCT', 'LBXMOPCT','LBXNEPCT','LBXEOPCT','LBXBAPCT',
+                                                               'LBDLYMNO','LBDMONO','LBDNENO','LBDEONO',
+                                                               'LBDBANO','LBXRBCSI','LBXHGB',
+                                                               'LBXHCT','LBXMCVSI','LBXMCHSI',
+                                                               'LBXMC','LBXRDW','LBXPLTSI','LBXMPSI')])
+
+# no missing values in th enumeric featuers. 
+summary(full_imputed_df)
+```
+
+Impute the rest of missing values in the factor variables: 
+
+For the categorical factor variables, I will impute then with a median. Since the breakdown is quite evident in the majority of the factor features, these imputation should not cause significant bias - majority of the categorical features are heavily swayed toward one or another category. 
+
+```{r}
+# factor variables added 
+is.fact <- sapply(full.df, is.factor)
+factor.full<- full.df[!badrow, is.fact]
+
+knn.df<- cbind(factor.full, full_imputed_df)
+```
+
+### Impute the categorical values: 
+
+```{r mode function}
+mode <- function(x) {
+    ux <- unique(x)
+    ux[which.max(tabulate(match(x, ux)))]
+}
+
+knn.df<- knn.df %>%  mutate_if(is.factor, 
+                               funs(replace(.,is.na(.), mode(na.omit(.)))))
+#BPAEN1 only has one value type, I am going to omit that feature 
+knn.df<- knn.df %>% dplyr::select(-BPAEN1)
+summary(knn.df)
+```
+
+
+Now this dataset contains fully imputed values. I will double check the distribution to see if I need not further apply any transformation. 
+
+```{r}
+knn.df %>% dplyr::select_if(is.numeric) %>%  
+  gather(cols, value) %>% 
+  ggplot(aes(x = value)) +
+  geom_histogram() + 
+  facet_wrap(.~cols, scale = "free") +
+  ggtitle("Distributions of the numeric\n values in the kNN imputed full dataset" ) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))  +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(axis.text.y = element_text(size = 5))
+```
+
+## Multicolinearity 
+
+
+```{r}
+knn.df %>%  dplyr::select_if(is.factor) %>% names
+```
+
+
+```{r}
+knn.df.dummy<- fastDummies::dummy_columns(knn.df, 
+                                          select_columns= c("PEASCST1",  "BPQ150A" ,  "BPQ150B" , 
+                                                            "BPQ150C"  , "BPQ150D",  "BPAARM"  , 
+                                                            "BPACSZ", "BPXPULS",   "BPXPTY" ,  
+                                                            "BPAEN1",    "BPAEN2" ,   "BPAEN3"), 
+                                          remove_first_dummy = T, 
+                                          remove_selected_columns = T)
+
+knn.df.dummy %>% dplyr::select(-HSD010_re) %>% 
+  cor(., method ="spearman") %>% 
+  corrplot(., tl.cex = 0.5, title = "Correlation plot of all variables in full dataset")
+
+```
+
+This correlation plot demostrates us some expcted correlation values - first, the three repeats of blood pressure have obvious positive correlation. Since they are taken during the same survey, they are expected to have positive correlation. The three blood pressure measures also have a related question about diastolic blood pressure - epxcted positive correlation as well. Nother high level of correlation is seen between LBXLYPCT (Lymphocyte %) and LBXNEPCT (Segmented neutrophils %). Although the correlation is significant, these are significant values. I could omit one of the columns from future model building. 
+
+Another correlation is seen between LBXWBCSI and LBDNENO, which mackes sense since LBDNENO is a derived feature from the following expression: 
+
+LBDNENO = LBXWBCSI * LBXNEPCT /100 (round to 1 decimal))
+
+Next, LBXEOPCT (Eosinophil %) is highly correlated with LBDEONO, whihc is also a derived feature in this case: 
+
+LBDEONO = LBXWBCSI * LBXEOPCT/100 
+
+Other derived feature include: 
+
+LBDLYMNO = LBXWBCSI * LBXLYPCT/100 
+LBDMONO = LBXWBCSI * LBXMOPCT/100 
+LBDBANO = LBXWBCSI * LBXBAPCT/100
+
+Overall, the features which make up these derived feautres could be exluded from frurther analysis but I am going to give it a try. 
+
+Importantly, the response variable is not obviously (=significantly) correlated with any features in the dataset. 
+
+
+## Create data partition: 
+
+Using 75% of the data for training:
+```{r}
+set.seed(123)
+trainIndex <- createDataPartition(knn.df$HSD010_re, p = .75, 
+                                  list = FALSE, 
+                                  times = 1)
+
+(length(trainIndex)/(dim(knn.df)[1]))*100
+
+```
+
+```{r}
+knn.train.df<- knn.df[trainIndex, ]
+knn.test.df<- knn.df[-trainIndex, ]
+knn.test.df.y<- knn.test.df %>% dplyr::select( HSD010_re)
+knn.test.df<- knn.test.df %>% dplyr::select(-HSD010_re)
+```
+
+## Model application:
+
+### Logistic regression model 
+
+classificaiotn of patients into healthy/ non healthy self reported answers:
+logistic regression does not assume the residuals are normally distributed nor that the variance is constant
+
+
+```{r}
+glm.m1<- glm(HSD010_re~., data = knn.train.df, family = "binomial")
+summary(glm.m1)
+```
+
+I am going to perform step wise logistic regression based on AIC:
+
+```{r}
+best.glm.m1<- glm(HSD010_re~., data = knn.train.df, family = "binomial") %>%
+  stepAIC(trace = FALSE)
+summary(best.glm.m1)
+
+```
+
+Reamaining features include systolic (1st) and distolic (1,2) blood pressures,but also some features that do no look significant in the model, such as BPACSZ(number), which correspond to the "codded cuff size of the person taking the survee).Looks likes BPAEN2 ( correponds to enhacement used for the second blood pressue take) is also non significant in this model with asnwer 2 = "No". 
+
+```{r glm pred}
+probabilities <- best.glm.m1 %>% predict(knn.test.df, type = "response")
+predicted.classes <- ifelse(probabilities > 0.5, 1, 0)
+mean(predicted.classes == knn.test.df.y)
+
+pre.df<- as.data.frame(predicted.classes)
+pre.df$predicted.classes<- as.factor(pre.df$predicted.classes)
+confusionMatrix(pre.df$predicted.classes, knn.test.df.y$HSD010_re)
+```
+
+The model has a hihg specificity but a very low sensitivty.
+
+```{r}
+car::vif(best.glm.m1)
+```
+
+VIF is a good method of exploration of multicolinearity, Variance infaltion factor is considered as large >5 and extremely significant >10. I have a couple features in the model with a high VIF od almost 10 (~9.3) and I will exlude them from the model.
+
+
+Exploratin of logistic model with Cook's distance values:
+Thes one demostrated here have significant effect on the data and make up the significant outliers. 
+```{r}
+plot(best.glm.m1, which = 4, id.n = 5)
+```
+
+
+AUC and ROC: 
+
+```{r}
+library(pROC)
+pre.df$predicted.classes<- as.numeric(pre.df$predicted.classes)
+knn.test.df.y$HSD010_re<- as.numeric(knn.test.df.y$HSD010_re)
+roccurve.glm <- roc(knn.test.df.y$HSD010_re ~ pre.df$predicted.classes)
+# shows very bad performance:
+plot(roccurve.glm)
+```
+
+As expected, a very low value of the AUC for such a poor performace in terms of sensitivity of the model. 
+```{r}
+auc(roccurve.glm)
+```
+
+
+### Classification with rules:
+
+```{r}
+knn.train.tree.y<- knn.train.df %>% dplyr::select(HSD010_re)
+knn.train.tree<- knn.train.df %>% dplyr::select(-HSD010_re)
+
+rules_mod <- C5.0(x = knn.train.tree, 
+                  y = knn.train.tree.y$HSD010_re, rules = TRUE)
+summary(rules_mod)
+```
+
+
+```{r rules pred}
+rules.pred<- predict(rules_mod, newdata = knn.test.df)
+rules.pred<- as.data.frame(rules.pred)
+rules.pred$rules.pred<- as.factor(rules.pred$rules.pred)
+knn.test.df.y$HSD010_re<- ifelse(knn.test.df.y$HSD010_re == 1, 1, 0)
+knn.test.df.y$HSD010_re<- as.factor(knn.test.df.y$HSD010_re)
+confusionMatrix(rules.pred$rules.pred, knn.test.df.y$HSD010_re)
+```
+Very high specificity but very low sensitivity - true positives are barely recognized. Although the accuracy is good, we have a large issue of being biased towards always predicting 1 isntead of 0 and because that dataset is unbalances, this issue creates high accuracy but low sensitivity. 
+
+```{r}
+prop.table(table(knn.df$HSD010_re))
+```
+
+__ROC and AUC__: 
+
+```{r}
+rules.pred$rules.pred<- as.numeric(rules.pred$rules.pred)
+knn.test.df.y$HSD010_re<- as.numeric(knn.test.df.y$HSD010_re)
+roccurve.C5 <- roc(knn.test.df.y$HSD010_re ~ pre.df$predicted.classes)
+# shows very bad performance:
+plot(roccurve.C5)
+
+```
+
+Expected low value of AUC for low sensitivity of the model. 
+```{r}
+auc(roccurve.C5)
+```
+
+
+### Neural Net 
+
+Values for neural net need to be normalized, in this case this was done with z score normalization before kNN imputation. 
+```{r NN df split}
+NN_train<- knn.df.dummy[trainIndex, ]
+NN_test<- knn.df.dummy[-trainIndex, ]
+NN_test_y<- NN_test %>% dplyr::select(HSD010_re)
+NN_test_y$HSD010_re<- ifelse(NN_test_y$HSD010_re == 1, 1, 0)
+NN_test <- NN_test %>% dplyr::select(-HSD010_re)
+NN_train$HSD010_re<- ifelse(NN_train$HSD010_re==1, 1,0)
+```
+
+
+
+```{r formalu creation}
+n <- names(NN_train)
+f <- as.formula(paste("HSD010_re~", paste(n[!n %in% "HSD010_re"], collapse = " + ")))
+f
+```
+
+```{r}
+# linear.output=FALSE specifies that I want to do classification and not regression. 
+neu.class1<- neuralnet(f, data = NN_train, linear.output= FALSE, stepmax=1e6)
+
+plot(neu.class1, rep = "best")
+
+#  error of the neural network model, along with the weights between the inputs, hidden layers, and outputs:
+neu.class1$result.matrix
+
+```
+
+```{r}
+neu.class1.pred<- compute(neu.class1, NN_test)
+cor(NN_test_y$HSD010_re, neu.class1.pred$net.result)
+```
+
+```{r}
+prob <- neu.class1.pred$net.result
+pred <- ifelse(prob>0.5, 1, 0)
+pred<- as.data.frame(pred)
+pred$V1<- as.factor(pred$V1)
+NN_test_y$y_fac<-as.factor(NN_test_y$HSD010_re)
+```
+
+
+```{r}
+confusionMatrix(data = pred$V1, reference = NN_test_y$y_fac)
+```
+
+Interestingly, neural net performs not better than the rest of the algorithms.It consistently calls only one category - the overrepresented one. 
+
+### SVM Model
+
+```{r}
+knn.svm_1<- ksvm(HSD010_re~., data = knn.train.df, kernel = "rbfdot")
+
+knn.pred.svm_1<- predict(knn.svm_1, newdata = knn.test.df)
+
+# confusion matrix:
+knn.pred.svm_1<- as.data.frame(knn.pred.svm_1)
+knn.pred.svm_1$knn.pred.svm_1<- as.factor(knn.pred.svm_1$knn.pred.svm_1)
+
+#make sure that the reference response is in the correct format:
+knn.test.df.y$HSD010_re<- ifelse(knn.test.df.y$HSD010_re == 1, 1, 0)
+knn.test.df.y$HSD010_re<- as.factor(knn.test.df.y$HSD010_re)
+
+confusionMatrix(knn.pred.svm_1$knn.pred.svm_1,knn.test.df.y$HSD010_re)
+```
+In line with previous models, this has a very low sensitivity level, which becomes a real problem in a real dataset (since we are not able to confidently call out the true positives). Sensitivity of this model is almost non existent. 
+
+```{r}
+knn.pred.svm_1$knn.pred.svm_1<- ifelse(knn.pred.svm_1$knn.pred.svm_1 == 0, 0, 1)
+roccurve_svm_1<- roc(knn.test.df.y$HSD010_re, knn.pred.svm_1$knn.pred.svm_1)
+plot(roccurve_svm_1)
+```
+
+```{r}
+auc(roccurve_svm_1)
+```
+
+## PCA 
+
+For PCA analysis, my dataset is already scaled, and I will used the fast Dummy encoded data for that, as PCA can handle one hot encoded categorical variables, and does not work with factors (since we are minimizing the variance of all but teh first few components). Data for PCA needs to be scaled (knn.df.dummy)
+
+```{r}
+pca_train<- knn.df.dummy[trainIndex, ] %>% dplyr::select(-HSD010_re)
+pca_test<- knn.df.dummy[-trainIndex, ] %>% dplyr::select(-HSD010_re)
+
+
+pca <- prcomp(pca_train)
+
+# variance :
+pr_var <- pca$sdev^2
+# % of variance 
+prop_varex<- pr_var/sum(pr_var)
+
+plot(prop_varex, xlab = "Principal Component", ylab = "Proportion of dvariance explained", type = "b")
+```
+
+```{r}
+# scree plot:
+plot(cumsum(prop_varex), xlab = "Principal component", ylab = "Cumulative Proportion of Variance explined", type = "b")
+```
+
+Based on this screeplot, we can reduce the dfimensions of our dataset used in the modelling down to 14 components, as more than 90% of the variance in the dataset is epxlained by them. That is a significant reduction from 44 features. 
+Further use this first 14 components (instead of 44) to in the modelling. 
+Data frame for model learning on the pricnipal component analysis data set:
+
+```{r}
+# this data set contains my response variable and all the pricniple components. 
+train<- data.frame(HSD010_re = knn.train.df$HSD010_re, pca$x)
+# first column is the reposnes variable, the next 14 are the principal components I am chooosing to keep"
+new_train_pca<- train[,1:15]
+
+
+# pca.test has the same information as the normal knn full dummy test set but we need to convert the test data set into the principal component measure, so we use the calculated pca to predict the test eigenvectors. 
+t<- as.data.frame(predict(pca, newdata = pca_test))
+# choose the same principal components as in the train data:
+new_test_pca<- t[,1:14]
+# to check how the classifier worked, we can still use:
+pca_test_y<- knn.df.dummy[-trainIndex, ] %>% dplyr::select(HSD010_re)
+```
+
+### Neural Net with PCA
+
+I am going to see if the neural net performance of non mice imputated and still imbalanced data will improve upon using PCA:
+
+```{r}
+n2<- names(new_train_pca)
+f2<- as.formula(paste("HSD010_re~", paste(n2[!n2 %in% "HSD010_re"], collapse = "+")))
+f2
+```
+
+```{r}
+set.seed(123)
+new_train_pca$HSD010_re<- ifelse(new_train_pca$HSD010_re == 1, 1, 0)
+nn_pca<- neuralnet(f2, new_train_pca, linear.output= FALSE, hidden =4,  stepmax=1e6 )
+plot(nn_pca)
+```
+
+
+```{r}
+set.seed(123)
+nn_pca_res<- compute(nn_pca, new_test_pca)
+pca_test_y$HSD010_re<- ifelse(pca_test_y$HSD010_re == 1, 1, 0)
+
+results_pca_nn<- data.frame(actual = pca_test_y$HSD010_re, prediction = round(nn_pca_res$net.result))
+confusionMatrix(table(results_pca_nn))
+```
+
+There has bee a significant improvmenet in neural net performance using PCA data  - accuracy went up to 77%, sensitivity of 55%, and specificity of 78%. 
+
+### SVM with PCA 
+
+```{r}
+set.seed(123)
+# test - new_test_pca
+# test y - pca_test_y
+# train - new_train_pca
+pca.svm<- ksvm(HSD010_re~., data = new_train_pca, kernel = "rbfdot")
+
+pca.pred.svm_1<- predict(pca.svm, newdata = new_test_pca)
+
+# confusion matrix:
+pca.pred.svm<- as.data.frame(round(pca.pred.svm_1))
+
+pca.pred.svm$V1<- as.factor(pca.pred.svm$V1)
+pca_test_y$HSD010_re<- as.factor(pca_test_y$HSD010_re)
+confusionMatrix(pca.pred.svm$V1,pca_test_y$HSD010_re)
+
+```
+Still strongly misclassified. Goign further, I am going to take a different approach to working with my imbalanced data. 
+Using PCA data for the radial svm does not work. I am going to make a cross validated version fo svm radial usins this PCA dataset: 
+
+##### K fold cv SVM PCA 
+
+```{r}
+new_train_pca$HSD010_re<- as.factor(new_train_pca$HSD010_re)
+fit.control <- caret::trainControl(method = "cv", number = 10)
+svm_pca.fit<- caret::train(HSD010_re~., data = new_train_pca,
+                           method = "svmRadial",trControl = fit.control)
+print(svm_pca.fit)
+
+```
+
+```{r}
+svm_pca_pred<- data.frame(pred = predict.train(svm_pca.fit, new_test_pca))
+confusionMatrix(svm_pca_pred$pred, pca_test_y$HSD010_re)
+```
+Misclassification for one class. 
+
+------------------------------------------
+
+## Different Approach: 
+
+I am going to use mice to impute the values and have a different breakdown of the dataset into training and testing to achieve better classification and avoid the unbalanced class problem as much as posssible:
+
+### Mice imputation:
+
+
+badrow (rows with missing values in each feature) will be excluded from mice imputation as well. 
+The work is picked up at the scaled (z score normalized), centered, and significant outlier removed dataset (full.df). 
+This a relatively large dataset, so too many iterations can be time consuming.
+
+"The mice package assumes a distribution for each variable and imputes missing variables according to that distribution."[https://uvastatlab.github.io/2019/05/01/getting-started-with-multiple-imputation-in-r/}]
+
+```{r}
+# making sure to omit the categorical feature which has only one factor level and NA values - not informative and prevents effective imputation. 
+full.df<- full.df %>% dplyr::select(-BPAEN1)
+
+# using mice function, I am going to consider  imputing all rows except for the SEQN - that feature will be omitted going forward overall. This imputation is done using random forest method.
+mice.mis <- mice(full.df[!badrow, !names(full.df) %in% "SEQN"], 
+                 method="rf", maxit = 3, print =  FALSE)  
+summary(mice.mis)
+mice.df <- complete(mice.mis)  # generate the completed data.
+anyNA(mice.df)
+
+```
+There are no remaining missing values in the dataset. 
+
+### Unbalanced data split:
+
+
+Common ways to deal with unbalanced data is to undersample or oversample respective underreprsented or overrepresented classes. That might not be always the best solution, and K means algoruthm is sometimes used to deal with the unbalanced. Kmeans SMOTE (Synthetic Minority Over-sampling Technique) is one of such methods - can be implemented in Python - synthetic dataset is created to make up for the imbalance in the smaller class, as the cost of not observing a smaller interetsting class can be significant ( often those are the cases we want to identify).[https://jair.org/index.php/jair/article/view/10302]. Library ROSE in R also generates synthetic observations and allows us to not loose significant data from undersampling, while minimizing the issue of repeating the same vaues in overampling the smaller class. Is is also cited that undersampling the majority can achieve a better classifier performace. I am going to attempt that on my data set: 
+
+
+```{r}
+library(ROSE)
+# a repeated column:
+mice.df<- mice.df %>% dplyr::select(-HSD010)
+# perform synthetic data additon 
+mice.df.rose <- ROSE(HSD010_re ~ ., data = mice.df, seed = 1)$data
+# this generated a well balanced dataset. 
+prop.table(table(mice.df.rose$HSD010_re))
+```
+
+Next, I want to see if this will make my classifiers better: 
+
+```{r}
+# Dimensions are the same, I can use the same indexing for splitting the data: 
+dim(mice.df.rose)
+```
+
+```{r mice rose split}
+mice.rose.train<- mice.df.rose[trainIndex, ]
+mice.rose.test<- mice.df.rose[-trainIndex, ]
+mice.rose.test.y<- mice.rose.test %>% dplyr::select(HSD010_re)
+mice.rose.test<- mice.rose.test %>% dplyr::select(-HSD010_re)
+```
+
+
+#### Logistic regression in mice rose:
+
+```{r}
+glm.m2<- glm(HSD010_re~., data = mice.rose.train, family = "binomial")
+summary(glm.m2)
+```
+
+performing similar step wise rergession: 
+```{r}
+set.seed(123)
+best.glm.m2<- glm(HSD010_re~., data = mice.rose.train, family = "binomial") %>%
+  stepAIC(trace = FALSE)
+summary(best.glm.m2)
+
+```
+
+Variance inflation factor exploration:
+```{r}
+vif(best.glm.m2)
+```
+No significant issues identified there. 
+
+We can perform additional formula tweaking for this model, as there are still features used that are non significant. Previous step wise regression was done on the basis of AIC. Next can be done on the basis of p value of each included factor. But first, I am going to test how well this model performs: 
+
+```{r glm mice rose pred}
+probabilities_2 <- best.glm.m2 %>% predict(mice.rose.test, type = "response")
+predicted.classes_2 <- ifelse(probabilities_2 > 0.5, 1, 0)
+mean(predicted.classes_2 == mice.rose.test.y$HSD010_re)
+
+pre.df_2<- as.data.frame(predicted.classes_2)
+pre.df_2$predicted.classes_2<- as.factor(pre.df_2$predicted.classes_2)
+confusionMatrix(pre.df_2$predicted.classes_2, mice.rose.test.y$HSD010_re)
+
+```
+
+Upon this modification, Sensitivity was significantly increased, however, the overall accuracy of the model suffered. In general, less than half predictions are correct.
+
+
+
+```{r}
+library(pROC)
+pre.df_2$predicted.classes<- as.numeric(pre.df_2$predicted.classes)
+mice.rose.test.y$HSD010_re_int<- as.numeric(mice.rose.test.y$HSD010_re)
+roccurve.glm_2 <- roc(mice.rose.test.y$HSD010_re_int ~ pre.df_2$predicted.classes)
+
+plot(roccurve.glm_2)
+```
+
+```{r}
+cat("Area under the curve",auc(roccurve.glm_2), "shows some improvement in the model")
+```
+
+##### K fold cross validation - GLM 
+
+
+Logistic regression has no hyperparameters to tune over; the estimates for the coefficients will always be given by maximum likelihood. The repeated k-fold cross validation will do nothing to affect the estimates of the (parameters/coefficients)[https://stats.stackexchange.com/questions/280533/should-logistic-regression-models-generated-with-and-without-cross-validation-in]
+
+
+```{r}
+best.glm.m2$coefficients
+```
+
+
+```{r}
+set.seed(123)
+fit.control <- caret::trainControl(method = "cv", number = 10)
+
+glm.fit <- caret::train(HSD010_re ~  BPQ150A  +  BPQ150C  +  BPQ150D  +   BPAARM   +  BPAARM   +  BPACSZ+     BPACSZ  +   BPACSZ +BPXPLS +    BPXPTY  +    BPXML1   +   BPXSY1     +BPAEN2 +     BPXSY3  +   BPAEN3   + LBXWBCSI  +  LBXNEPCT+ LBXBAPCT + LBDMONO  +   LBDNENO  +   LBDEONO   +   LBXHGB  +  LBXMCHSI   +    LBXMC  +    LBXRDW ,
+                       data = mice.rose.train,
+                       method = "glm",
+                       trControl = fit.control)
+print(glm.fit)
+```
+
+Using this "best" chosen model through k fold cross validation, we can make the following prediction:
+
+```{r}
+predictions.glm<-as.data.frame(predict.train(object= glm.fit,mice.rose.test,type="raw"))
+names(predictions.glm)<- "pred"
+
+confusionMatrix(predictions.glm$pred, as.factor(mice.rose.test.y$HSD010_re))
+```
+
+
+
+#### Rules classification 
+
+```{r warning=FALSE}
+set.seed(123)
+mice.rose.rules.train_y<- mice.rose.train %>% dplyr::select(HSD010_re)
+mice.rose.rules.train<- mice.rose.train %>% dplyr::select(-HSD010_re)
+
+rules_micerose_mod <- C5.0(x = mice.rose.rules.train, y = mice.rose.rules.train_y$HSD010_re, rules = TRUE)
+summary(rules_micerose_mod)
+
+```
+
+
+```{r}
+rules.pred_2<- predict(rules_micerose_mod, newdata = mice.rose.test)
+rules.pred_2<- as.data.frame(rules.pred_2)
+rules.pred_2$rules.pred_2<- as.factor(rules.pred_2$rules.pred_2)
+mice.rose.test.y$HSD010_re<- as.factor(mice.rose.test.y$HSD010_re)
+confusionMatrix(rules.pred_2$rules.pred_2, mice.rose.test.y$HSD010_re)
+
+```
+
+Rules perform better on this model than lofistic regression. Sensitivity was significantly increased compared to the non mice imputed and ROSE synthetically generated data using model. Accuracy is jsut above a half, so our prediction with this model would be somewhat better than chance. 
+
+```{r}
+rules.pred_2$rules.pred_2_inte<- as.numeric(rules.pred_2$rules.pred_2)
+roccurve.rules_2 <- roc(mice.rose.test.y$HSD010_re_int ~ pre.df_2$predicted.classes)
+
+plot(roccurve.rules_2)
+```
+
+```{r}
+auc(roccurve.rules_2)
+```
+
+#####  K fold cross validation:;
+
+```{r warning = FALSE}
+set.seed(123)
+C5.fit <- caret::train(HSD010_re ~.,
+                       data = mice.rose.train,
+                       method = "C5.0",
+                       trControl = fit.control, trace = FALSE)
+print(C5.fit)
+
+```
+
+This allows us to explore the relatoinship between the estimates of the performance and the tunning parameters used here: this demonstrates that the oevrall accuracy of the rules and the tree is higher within the no Winnowing tunning. 
+```{r}
+trellis.par.set(caretTheme())
+plot(C5.fit)  
+```
+
+Prediction using k fold cross validated model:
+
+```{r}
+predictions.C5<- data.frame(pred = predict.train(C5.fit, mice.rose.test))
+confusionMatrix(predictions.C5$pred, mice.rose.test.y$HSD010_re)
+```
+
+Using k fold cross validation, we can obtain a well balanced model that brings up the values of sensitivity and specificity, while maintaing some favorable accuracy. While as we can see from the ensemble built, this k fold cross vaidated rule model is not as good as the full ensemble, there is still some value to it.  
+
+#### Neural network: 
+
+```{r}
+micerose.df.dummy<- fastDummies::dummy_columns(mice.df.rose,
+select_columns= c("PEASCST1",  "BPQ150A" ,  "BPQ150B" ,  "BPQ150C"  ,
+                  "BPQ150D",  "BPAARM"  , "BPACSZ", "BPXPULS", 
+                  "BPXPTY" ,    "BPAEN2" ,   "BPAEN3"),
+remove_first_dummy = T,
+remove_selected_columns = T)
+```
+
+```{r data split}
+NN_train_2<- micerose.df.dummy[trainIndex, ]
+NN_test_2<- micerose.df.dummy[-trainIndex, ]
+NN_test_2_y<- NN_test_2 %>% dplyr::select(HSD010_re)
+NN_test_2_y$HSD010_re<- ifelse(NN_test_2_y$HSD010_re == 1, 1, 0)
+NN_test_2 <- NN_test_2 %>% dplyr::select(-HSD010_re)
+NN_train_2$HSD010_re<- ifelse(NN_train_2$HSD010_re==1, 1, 0)
+```
+
+There is no need to add additional hidden layers to the model as the data is not complex enough to significanlty benefit from it. 
+```{r}
+set.seed(123)
+# linear.output=FALSE specifies that I want to do classification and not regression. 
+neu.class2<- neuralnet(f, data = NN_train_2, linear.output= FALSE, stepmax=1e6)
+
+plot(neu.class2, rep = "best")
+
+```
+
+The correlation between the predicted values and the actual out of sample test response variable is quite low. 
+```{r}
+neu.class2.pred<- compute(neu.class2, NN_test_2)
+cor(NN_test_2_y$HSD010_re, neu.class2.pred$net.result)
+```
+
+Preparing the data for the confusion Matrix. 
+```{r}
+prob <- neu.class2.pred$net.result
+pred <- ifelse(prob>0.5, 1, 0)
+pred<- as.data.frame(pred)
+pred$V1<- as.factor(pred$V1)
+NN_test_2_y$y_fac<-as.factor(NN_test_2_y$HSD010_re)
+```
+
+
+```{r}
+confusionMatrix(data = pred$V1, reference = NN_test_2_y$y_fac)
+```
+This Neural net perfoms much better - better so than the original neural net and still somwehat worse than the new set of rules on the mice rose treated data set. The goal of increasing sensitivity was achieved, which, arguably, is the more important factor. Obtaining a true positive of 0 as in not having reported good health is the important classification here. There is no value in prediction of the classification if everybody is automatically considered healthy by default. Still, sensitivity is below 0.5 - to applicable in real life conditions. 
+
+Double checking the distributions of the data for neural net - it needs to be normal - this condition is maintained:
+
+```{r}
+mice.df.rose %>% dplyr::select(-HSD010_re) %>% 
+  select_if(is.numeric) %>%  gather(cols, value) %>% 
+  ggplot(aes(x = value)) + geom_histogram() + 
+  facet_wrap(.~cols, scale = "free") + 
+  ggtitle("Distributions of the numeric\n values in the full blood dataset- \n  labs and pressure") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))  + 
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+ROC and AUC:
+
+```{r}
+pred$V1<- as.integer(pred$V1)
+roccurve.neural_2 <- roc(NN_test_2_y$HSD010_re ~ pred$V1)
+plot(roccurve.neural_2)
+```
+
+Consistently, however, the area under the curve remains not particularly high and equal wihin the three classification models I used. 
+```{r}
+auc(roccurve.neural_2)
+```
+
+
+##### K fold cross validation:
+
+```{r }
+set.seed(123)
+nn.fit <- caret::train(HSD010_re ~.,
+                       data = mice.rose.train,
+                       method = "nnet",
+                       trControl = fit.control, trace = FALSE)
+```
+
+
+```{r}
+print(nn.fit)
+```
+
+Using k fold cross validation, we obtain the best performing model with accuracy just baout 60% - within the range of what was obtained before. 
+
+```{r}
+predictions.nn<- data.frame(pred = predict.train(nn.fit, mice.rose.test))
+confusionMatrix(predictions.nn$pred, mice.rose.test.y$HSD010_re)
+```
+
+#### SVM model:
+
+Next, I am going to perform SVM with radial kernel on my mice imputed and synthetically balanced dataset. 
+
+```{r}
+set.seed(123)
+micerose.svm<- ksvm(HSD010_re~., data = mice.rose.train, kernel = "rbfdot")
+
+micerose.pred.svm<- predict(micerose.svm, newdata = mice.rose.test)
+
+
+micerose.pred.svm<- as.data.frame(micerose.pred.svm)
+confusionMatrix(micerose.pred.svm$micerose.pred.svm,mice.rose.test.y$HSD010_re )
+
+```
+Finaly, we can see a slightly more appropriate model for predicting the reported health status 0 out overall accuracy is ~66%, sensitivity went up from almost non existent to 72% and Specificity of about 60%. Overall accuracy (65%) still outperforms Neural net classification in the previous test. 
+
+```{r}
+micerose.pred.svm$svm_pred<- ifelse(micerose.pred.svm$micerose.pred.svm == 0, 0, 1)
+roccurve_svm_2<- roc(mice.rose.test.y$HSD010_re, micerose.pred.svm$svm_pred)
+plot(roccurve_svm_2)
+```
+
+Classification on this modified data set with SVM works the best out of all previous models. 
+
+```{r}
+cat("Area under the curve is ", auc(roccurve_svm_2), "which is an improvement to the previous algorithms used")
+```
+
+
+##### K fold for SVM Radial:
+
+```{r}
+set.seed(123)
+svm.fit<- caret::train(HSD010_re~., data = mice.rose.train, method = "svmRadial",trControl = fit.control)
+print(svm.fit)
+
+```
+With k fold cross validation, we otbain a slightly improved model in terms of accuracy. 
+
+
+```{r}
+set.seed(123)
+predictions.svm <- data.frame(pred= predict.train(svm.fit, mice.rose.test ))
+confusionMatrix(predictions.svm$pred, mice.rose.test.y$HSD010_re)
+```
+
+Radial kernel for SVM achievs the best results for classification. 
+
+## Ensemble Building 
+
+
+```{r}
+library(caretEnsemble)
+set.seed(123)
+control <- trainControl(method="repeatedcv", number=10, classProbs=TRUE)
+
+algorithmList <- c('nnet', 'glm', 'C5.0', 'svmRadial')
+
+# try this to deal with factor level issue
+levels(mice.rose.train$HSD010_re) <- c("first_class", "second_class")
+levels(mice.rose.test.y$HSD010_re) <- c("first_class", "second_class")
+
+set.seed(345)
+models <- caretList(HSD010_re~., data=mice.rose.train, trControl=control, methodList=algorithmList, trace = FALSE)
+results <- resamples(models)
+summary(results)
+dotplot(results)
+
+
+```
+This plot demonstrates the obtained levels of accuracy and kappa (the default metrics for classification algorithms) for all algorithms used in the ensemble. This demonstrates that overall, similar to the results obtained without k fold cross validation, logistic regression performs with just about the worst accuracy, while svm with radila kernel does the best in accuratly classifing our response variable. 
+
+
+__Stack__
+
+Stack using simple logistic regression:
+```{r}
+set.seed(234)
+stackControl <- trainControl(method="repeatedcv", number=10, repeats=3, classProbs=TRUE)
+stack.glm <- caretStack(models, method="glm", metric="Accuracy", trControl=stackControl)
+print(stack.glm)
+```
+
+Doing similar stacking but checking for ROC, sensitivity, and specificity of the same model.
+twoClassSummary uses AUC to compare the models, therefore, this is the final model I am going to proceed with.
+
+```{r}
+set.seed(234)
+stackControl2<- trainControl(method="repeatedcv", number=10, repeats=3, classProbs=TRUE, summaryFunction=twoClassSummary)
+
+stack.glm2<- caretStack(models, method="glm", trControl=stackControl2)
+print(stack.glm2)
+```
+
+
+Upon using stakcing with simple logistic regression of the four models used previosuly ( rules using C5.0 algorithm, neural net for classification, logistic regression, and svm with radial kernel), I achieved an accuracy level of 0.66 = ~67%. 
+The same model evaluated with ROC, sensitivity, and speicificity demonstrates ROC value of 0.72, Sensitifvity of 69%, and specificity of about ~65%. These are all higher characterstics than obtained through any inidividual model applied to the imputed balanced dataset. 
+
+What ensemble model managed to accomplish is to develop a balanced model- there is some accuracy loss overall, compared to, for example, k fold validated svm radial model, but at the same time we have higher sensitivity and specificity before. 
+
+Apply the stacked model:
+
+```{r}
+final.pred<-data.frame(pred = predict(stack.glm2,  mice.rose.test))
+confusionMatrix(final.pred$pred, mice.rose.test.y$HSD010_re)
+```
+
+As expected from the analysis with k fold cross validation of the stacked model, this model performs with 66% accuracy, sensitivity of 68%, and specificity of 63%. 95% confidence internval for the accuracy woud be 0.6324, 0.6798. Overall, the model is significant. The classes has to be recoded due to the neture of caretStack and classification clagorithms but they were equally recoded in both train, test, and reference. 
+
+Overall, we can succesfully predict the response of the health status of the individual from blood lab results and related survey questions. Although the prediction is not perfect, and the model performace is not optimal, I can see potential for improvement with additional data - this prediction is based from quite one sided blood results.
+
+
+
+## Analysis and CRISP DM 
+
+Summarizing everything that was done in this project, I idenitified the busines goal of performing this analysis - ideally, we would be able to modify the health treatment plan to increase the number of people reporting healthy status based on just limited and quite non invasive lab work. Our data in this case was mixed - categorical and numerical, representing survey results and actual blood lab results.The survey results contained many missing values, which is a common issue with survey data and in the data preparation point of the project, feature elimination and data imputation was performed in order to use the data the most effectively in the modelling. This work intersected with the modelling work and some of the issues of imbalanced classes in the original data became an issue upon the modelling itself - this requried additional data preparation through synthetically generatting underrepresented dataset. In terms of evaluation, there is no doubt that the original dataset, although impouted with knn and mode, adn transformed to be on the same scale and normalized, was not suitable for utilization in classification using these algorithms. However, models built on balanced data set had a significant improvement in their power. AUC for the four models ( glm, rules, NN, SVM,) were the following: 0.6045809, 0.6046, 0.5712, 0.6589249; which clearly demostrates that SVM with radial kernel has the best performance on this dataset. Overall, the models perform pretty similarly on this new dataset, and have some classification power. The caveats, as discussed , include disbalance in the classes of the original dataset. Tunning of the model was done with trainControl in the caret library.Deployment was not done in any way in terms of Shiny app but everything was uploaded to Github: https://github.com/valentinastoma/NationaHealth
+
+
+
+
