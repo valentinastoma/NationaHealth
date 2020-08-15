@@ -6,8 +6,8 @@ and Unhealthy status (0) and a number of machine learning algorithms was applied
 
 Some of the approcahes taken to achieving the goals of classification incldued: 
 
-1. Imputation with (MICE package)[https://cran.r-project.org/web/packages/mice/mice.pdf]  - application of Multivariate Imputation by Chained Equations. 
-2. Balancing unbalanced class representation with (ROSE library)[https://cran.r-project.org/web/packages/ROSE/ROSE.pdf] to perform random oversampling. 
+1. Imputation with [MICE package](https://cran.r-project.org/web/packages/mice/mice.pdf)  - application of Multivariate Imputation by Chained Equations. 
+2. Balancing unbalanced class representation with [ROSE library](https://cran.r-project.org/web/packages/ROSE/ROSE.pdf) to perform random oversampling. 
 3. Following classification algorithms were utilized: 
 
 - Logistic Regression 
