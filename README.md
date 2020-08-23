@@ -15,5 +15,7 @@ Some of the approcahes taken to achieving the goals of classification incldued:
 - Neural Network 
 - Rules classification with C5.0
 
+File with .md extension contains the most **user-friendly readable** version of the project. 
+
 
 
